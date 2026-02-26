@@ -22,4 +22,10 @@ setuptools.setup(
         "PyJWT>=2.1.0",
         "requests>=2.25.1",
     ],
+    extras_require={
+        "test": [
+            "pytest>=8.0.0",
+            "vcrpy>=6.0.0",
+        ],
+    },
 )

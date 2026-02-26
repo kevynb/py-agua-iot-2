@@ -68,3 +68,13 @@ If you happen to know any extra or missing customer codes and API URL's, please 
 ### Home Assistant
 
 Home Assistant plugin using this library: [home_assistant_micronova_agua_iot](https://github.com/vincentwolsink/home_assistant_micronova_agua_iot)
+
+## Integration tests
+
+This project includes a cassette-based integration harness using `pytest` and `vcrpy`.
+
+- Install dependencies: `python -m pip install -e ".[test]"`
+- Replay tests only: `pytest tests/integration -m integration`
+- Record or refresh cassettes (with `AGUA_*` env vars set): `VCR_RECORD_MODE=once pytest tests/integration -m integration`
+
+Detailed recording instructions are in `tests/integration/README.md`.
