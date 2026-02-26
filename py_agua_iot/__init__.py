@@ -1,13 +1,15 @@
 """py_agua_iot provides controlling heating devices connected via
 the IOT Agua platform of Micronova
 """
-import jwt
+import hashlib
 import json
 import logging
+import os
 import re
-import requests
+import tempfile
 import time
-import re
+import jwt
+import requests
 from . import formula_parser
 
 try:
@@ -32,6 +34,8 @@ API_PATH_DEVICE_JOB_STATUS = "/deviceJobStatus/"
 API_PATH_DEVICE_WRITING = "/deviceRequestWriting"
 API_LOGIN_APPLICATION_VERSION = "1.9.5"
 DEFAULT_TIMEOUT_VALUE = 5
+DEFAULT_REGISTER_MAP_CACHE_TTL_SECONDS = 15552000  # 180 days
+DEFAULT_REGISTER_MAP_CACHE_SUBDIR = "py-agua-iot"
 
 HEADER_ACCEPT = "application/json, text/javascript, */*; q=0.01"
 HEADER_CONTENT_TYPE = "application/json"
@@ -100,6 +104,9 @@ class agua_iot(object):
         brand_id=1,
         debug=False,
         api_login_application_version=API_LOGIN_APPLICATION_VERSION,
+        register_map_cache_enabled=False,
+        register_map_cache_ttl_seconds=DEFAULT_REGISTER_MAP_CACHE_TTL_SECONDS,
+        register_map_cache_dir=None,
     ):
         """agua_iot object constructor"""
         if debug is True:
@@ -130,6 +137,13 @@ class agua_iot(object):
         self.brand_id = str(brand_id)
         self.login_api_url = login_api_url
         self.api_login_application_version = api_login_application_version
+        self.register_map_cache_enabled = bool(register_map_cache_enabled)
+        self.register_map_cache_ttl_seconds = int(register_map_cache_ttl_seconds)
+        self.register_map_cache_dir = register_map_cache_dir
+        self._register_map_cache_cleaned = False
+
+        if self.register_map_cache_ttl_seconds <= 0:
+            raise ValueError("register_map_cache_ttl_seconds must be greater than 0")
 
         self.token = None
         self.token_expires = None
@@ -138,6 +152,177 @@ class agua_iot(object):
         self.devices = list()
 
         self._login()
+
+    def _get_register_map_cache_dir(self):
+        if self.register_map_cache_dir:
+            return self.register_map_cache_dir
+
+        return os.path.join(tempfile.gettempdir(), DEFAULT_REGISTER_MAP_CACHE_SUBDIR)
+
+    @staticmethod
+    def _normalize_device_id(device_id):
+        if device_id is None:
+            return None
+        return str(device_id).strip().upper().replace(":", "")
+
+    def _register_map_cache_key(self, device_id):
+        normalized_id = self._normalize_device_id(device_id)
+        return f"v1|device_id={normalized_id}"
+
+    def _register_map_cache_path(
+        self,
+        device_id,
+    ):
+        cache_key = self._register_map_cache_key(
+            device_id=device_id,
+        )
+        key_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+        return os.path.join(self._get_register_map_cache_dir(), f"{key_hash}.json")
+
+    def _register_map_cache_is_expired(self, created_at_epoch, now_epoch=None):
+        now_epoch = now_epoch if now_epoch is not None else time.time()
+        return now_epoch >= (float(created_at_epoch) + self.register_map_cache_ttl_seconds)
+
+    def _cleanup_expired_register_map_cache(self):
+        if self._register_map_cache_cleaned:
+            return
+
+        self._register_map_cache_cleaned = True
+        cache_dir = self._get_register_map_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        now_epoch = time.time()
+        for filename in os.listdir(cache_dir):
+            if not filename.endswith(".json"):
+                continue
+
+            cache_path = os.path.join(cache_dir, filename)
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cache_file:
+                    cached_data = json.load(cache_file)
+
+                created_at_epoch = cached_data.get("created_at_epoch")
+                if created_at_epoch is None:
+                    os.remove(cache_path)
+                    continue
+
+                if self._register_map_cache_is_expired(created_at_epoch, now_epoch):
+                    os.remove(cache_path)
+            except Exception:
+                # Ignore cleanup issues; they should not break the main flow.
+                continue
+
+    def _load_register_map_cache(self, device_id):
+        if not self.register_map_cache_enabled:
+            return None
+
+        self._cleanup_expired_register_map_cache()
+        cache_path = self._register_map_cache_path(
+            device_id=device_id,
+        )
+        if not os.path.exists(cache_path):
+            _LOGGER.debug("Register map cache miss for %s", cache_path)
+            return None
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                cached_data = json.load(cache_file)
+
+            created_at_epoch = cached_data.get("created_at_epoch")
+            register_map_dict = cached_data.get("register_map_dict")
+            if created_at_epoch is None or not isinstance(register_map_dict, dict):
+                _LOGGER.debug("Register map cache invalid for %s", cache_path)
+                return None
+
+            if self._register_map_cache_is_expired(created_at_epoch):
+                _LOGGER.debug("Register map cache expired for %s", cache_path)
+                return None
+
+            _LOGGER.debug("Register map cache hit for %s", cache_path)
+            return register_map_dict
+        except Exception:
+            _LOGGER.debug("Register map cache read failed for %s", cache_path)
+            return None
+
+    def _load_cached_security(self, device_id):
+        if not self.register_map_cache_enabled:
+            return None
+
+        cache_path = self._register_map_cache_path(device_id=device_id)
+        if not os.path.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                cached_data = json.load(cache_file)
+            meta = cached_data.get("meta", {})
+            security = meta.get("security_code")
+            return str(security) if security else None
+        except Exception:
+            _LOGGER.debug("Unable to read cached security from %s", cache_path)
+            return None
+
+    def _save_register_map_cache(
+        self,
+        device_id,
+        register_map_dict,
+        security_code=None,
+    ):
+        if not self.register_map_cache_enabled:
+            return
+
+        self._cleanup_expired_register_map_cache()
+        cache_dir = self._get_register_map_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = self._register_map_cache_path(
+            device_id=device_id,
+        )
+        normalized_id = self._normalize_device_id(device_id)
+
+        cache_payload = {
+            "created_at_epoch": time.time(),
+            "register_map_dict": register_map_dict,
+            "meta": {
+                "device_id": normalized_id,
+                "security_code": str(security_code) if security_code else None,
+            },
+        }
+
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cache_dir,
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                temp_file_path = tmp_file.name
+                json.dump(cache_payload, tmp_file)
+
+            os.replace(temp_file_path, cache_path)
+            _LOGGER.debug("Register map cache saved to %s", cache_path)
+        except Exception:
+            _LOGGER.debug("Register map cache write failed for %s", cache_path)
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+
+    def clear_register_map_cache(self):
+        cache_dir = self._get_register_map_cache_dir()
+        if not os.path.isdir(cache_dir):
+            return
+
+        for filename in os.listdir(cache_dir):
+            if not filename.endswith(".json"):
+                continue
+            cache_path = os.path.join(cache_dir, filename)
+            try:
+                os.remove(cache_path)
+            except OSError:
+                continue
 
     def _login(self):
         self.register_app_id()
@@ -302,6 +487,7 @@ class agua_iot(object):
                     dev["name_product"],
                     res2["device_info"][0]["id_registers_map"],
                     self,
+                    dev.get("security_code"),
                 )
             )
 
@@ -362,6 +548,7 @@ class Device(object):
         name_product,
         id_registers_map,
         agua_iot,
+        security_code=None,
     ):
         self.id = id
         self.id_device = id_device
@@ -371,10 +558,15 @@ class Device(object):
         self.is_online = is_online
         self.name_product = name_product
         self.id_registers_map = id_registers_map
+        self.security_code = security_code
         self.__agua_iot = agua_iot
         self.__register_map_dict = dict()
         self.__information_dict = dict()
         self.__canalization = dict()
+
+    @property
+    def device_id(self):
+        return self.__agua_iot._normalize_device_id(self.id_device)
 
     def update(self):
         """Update device information"""
@@ -383,6 +575,13 @@ class Device(object):
         self.__update_childs()
 
     def __update_device_registers_mapping(self):
+        cached_register_map = self.__agua_iot._load_register_map_cache(
+            device_id=self.device_id,
+        )
+        if cached_register_map is not None:
+            self.__register_map_dict = cached_register_map
+            return
+
         url = self.__agua_iot.api_url + API_PATH_DEVICE_REGISTERS_MAP
 
         payload = {
@@ -397,33 +596,57 @@ class Device(object):
             _LOGGER.debug("GETREGISTERSMAP CALL FAILED!")
             raise Error("Error while fetching registers map")
 
-        for registers_map in res["device_registers_map"]["registers_map"]:
+        register_map_dict = None
+        registers_maps = res["device_registers_map"]["registers_map"]
+        for registers_map in registers_maps:
             if registers_map["id"] == self.id_registers_map:
-                register_map_dict = dict()
-                for register in registers_map["registers"]:
-                    register_dict = dict()
-                    register_dict.update(
-                        {
-                            "reg_type": register["reg_type"],
-                            "offset": register["offset"],
-                            "formula": register["formula"],
-                            "formula_inverse": register["formula_inverse"],
-                            "format_string": register["format_string"],
-                            "set_min": register["set_min"],
-                            "set_max": register["set_max"],
-                            "mask": register["mask"],
-                        }
-                    )
-                    if "enc_val" in register:
-                        for v in register["enc_val"]:
-                            if v["lang"] == "ENG" and v["description"] == "ON":
-                                register_dict.update({"value_on": v["value"]})
-                            elif v["lang"] == "ENG" and v["description"] == "OFF":
-                                register_dict.update({"value_off": v["value"]})
-                    register_map_dict.update({register["reg_key"]: register_dict})
-                _LOGGER.debug("SUCCESSFULLY UPDATED REGISTERS MAP!")
-                _LOGGER.debug("REGISTERS MAP: %s", str(register_map_dict))
-                self.__register_map_dict = register_map_dict
+                register_map_dict = self.__build_register_map_dict(registers_map)
+                break
+
+        if register_map_dict is None and len(registers_maps) == 1:
+            _LOGGER.debug(
+                "No matching register map id found; using the only available map entry."
+            )
+            register_map_dict = self.__build_register_map_dict(registers_maps[0])
+
+        if register_map_dict is None:
+            _LOGGER.debug("REGISTER MAP ID NOT FOUND IN RESPONSE!")
+            raise Error("Error while fetching registers map")
+
+        _LOGGER.debug("SUCCESSFULLY UPDATED REGISTERS MAP!")
+        _LOGGER.debug("REGISTERS MAP: %s", str(register_map_dict))
+        self.__register_map_dict = register_map_dict
+        self.__agua_iot._save_register_map_cache(
+            device_id=self.device_id,
+            register_map_dict=register_map_dict,
+            security_code=self.security_code,
+        )
+
+    @staticmethod
+    def __build_register_map_dict(registers_map):
+        register_map_dict = dict()
+        for register in registers_map["registers"]:
+            register_dict = dict()
+            register_dict.update(
+                {
+                    "reg_type": register["reg_type"],
+                    "offset": register["offset"],
+                    "formula": register["formula"],
+                    "formula_inverse": register["formula_inverse"],
+                    "format_string": register["format_string"],
+                    "set_min": register["set_min"],
+                    "set_max": register["set_max"],
+                    "mask": register["mask"],
+                }
+            )
+            if "enc_val" in register:
+                for v in register["enc_val"]:
+                    if v["lang"] == "ENG" and v["description"] == "ON":
+                        register_dict.update({"value_on": v["value"]})
+                    elif v["lang"] == "ENG" and v["description"] == "OFF":
+                        register_dict.update({"value_off": v["value"]})
+            register_map_dict.update({register["reg_key"]: register_dict})
+        return register_map_dict
 
     def __update_device_information(self):
         url = self.__agua_iot.api_url + API_PATH_DEVICE_BUFFER_READING

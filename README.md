@@ -21,6 +21,14 @@ for device in connection.devices:
   print(device.name + ": " + str(device.air_temperature))
 ```
 
+Optional register-map cache parameters:
+
+- `register_map_cache_enabled=False` (default)
+- `register_map_cache_ttl_seconds=15552000` (default 6 months)
+- `register_map_cache_dir=None` (default: system temp dir + `py-agua-iot`)
+
+You can clear cached register maps at runtime with `connection.clear_register_map_cache()`.
+
 ## API URL's / Customer codes
 
 Below you can find a table with the app names of the different stove brands and their corresponding customer code and API URL.

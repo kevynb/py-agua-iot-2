@@ -12,7 +12,7 @@ CASSETTE_NAME = "bootstrap_flow.yaml"
 
 
 @pytest.mark.integration
-def test_bootstrap_flow_from_cassette_or_live_recording():
+def test_bootstrap_flow_from_cassette_or_live_recording(tmp_path):
     # Replay-only mode needs a previously recorded cassette.
     if not has_real_http_config() and not cassette_exists(CASSETTE_NAME):
         pytest.skip(
@@ -29,6 +29,8 @@ def test_bootstrap_flow_from_cassette_or_live_recording():
             cfg["unique_id"],
             login_api_url=cfg["login_api_url"],
             brand_id=cfg["brand_id"],
+            register_map_cache_enabled=True,
+            register_map_cache_dir=str(tmp_path),
         )
 
     assert isinstance(client.devices, list)
